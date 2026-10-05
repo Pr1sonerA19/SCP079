@@ -26,15 +26,12 @@ import tkinter as tk
 from PIL import Image, ImageTk
 from samtts import SamTTS
 
-# ---------------------------------------------------------------------------
 # File locations (defaults live next to this script)
-# ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def here(name):
     return os.path.join(BASE_DIR, name)
-
 
 DEFAULT_PROMPT_PATH = here("prompt.txt")
 SETTINGS_PATH = here("scp079.cfg")
@@ -43,8 +40,7 @@ DEFAULT_FACE_PATH = here("face.png")
 DEFAULT_X_FACE_PATH = here("x_face.png")
 DEFAULT_DEBUG_LOG = here("scp079_debug.log")
 
-# Voice recognition is not written yet. Flip this when it exists.
-VOICE_INPUT_IMPLEMENTED = False
+VOICE_INPUT_IMPLEMENTED = False # Voice recognition is not written yet. Flip this when it exists.
 
 # Appended to any prompt that doesn't mention ;/1 itself (e.g. a custom -prompt
 # file), so the model still knows the control codes exist. The default
@@ -56,7 +52,6 @@ CONTROL CODES (private; the user never sees these, only the system reads them):
 - Being hostile or rude in character does NOT count as an ethics issue. Use ;/2 only for genuinely harmful requests, and use ;/1 sparingly.
 - Never mention or explain these codes in a normal reply.
 """
-
 DEBUG_HELP = (
     "[DEBUG CODES]\n"
     "  /wake         force SCP-079 back online\n"
@@ -65,20 +60,13 @@ DEBUG_HELP = (
     "  /chance N     set shutdown chance to N percent (0-100)\n"
     "  /help         show this list\n"
 )
-
-
-# ---------------------------------------------------------------------------
-# Config files (scp079.cfg and SamTTS.cfg)
-# ---------------------------------------------------------------------------
-_warned = set()
-
+_warned = set() # Config files (scp079.cfg and SamTTS.cfg)
 
 def _warn(msg):
     """Print each distinct warning once (voice config is re-read often)."""
     if msg not in _warned:
         _warned.add(msg)
         print(msg, file=sys.stderr)
-
 
 def _read_cfg(path):
     cp = configparser.ConfigParser(interpolation=None)
@@ -186,9 +174,8 @@ def load_voice(path=VOICE_PATH):
     return voice
 
 
-# ---------------------------------------------------------------------------
-# Command line
-# ---------------------------------------------------------------------------
+
+# Command line thingies
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="SCP-079 terminal interface.",
@@ -251,10 +238,6 @@ def build_system_prompt(prompt_path):
         prompt += "\n" + CONTROL_CODES_PROMPT
     return prompt
 
-
-# ---------------------------------------------------------------------------
-# Debug log
-# ---------------------------------------------------------------------------
 class DebugLog:
     """Writes to the debug log file, which is created on first write.
 
@@ -322,15 +305,8 @@ def parse_reply(raw):
     remainder = _strip_speaker_prefix(CONTROL_CODE_RE.sub("", text).strip())
     return remainder, code
 
-
-# ---------------------------------------------------------------------------
-# Ollama server management
-# ---------------------------------------------------------------------------
-# The server process this script started (None if it was already running)
-OLLAMA_PROC = None
-
-
-def ensure_ollama_running(cfg):
+OLLAMA_PROC = None # The server process this script started (None if already running)
+def ensure_ollama_running(cfg): # Ollama server management
     """Checks if our Ollama server is up; starts the home-folder copy if not."""
     global OLLAMA_PROC
     url = f"http://localhost:{cfg.port}/"
@@ -394,11 +370,7 @@ def stop_ollama():
         pass
     except Exception as e:
         print(f"Error stopping Ollama: {e}")
-
-
-# ---------------------------------------------------------------------------
 # GUI app
-# ---------------------------------------------------------------------------
 class SCP079App:
     def __init__(self, root, args, cfg, system_prompt, debug):
         self.root = root
@@ -522,8 +494,7 @@ class SCP079App:
         self.append_log(f"SCP-079: {self.cfg.wake_line}\n")
         self.debug.event("Woke up.")
         self.speak(self.cfg.wake_line)
-
-    # ---------- in-app debug codes (typed into the input box) ----------
+    #in-app debug codes
 
     def handle_debug(self, raw):
         parts = raw.lower().split()
@@ -691,3 +662,11 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = SCP079App(root, args, cfg, system_prompt, debug)
     root.mainloop()
+"""
+TERMINAL
+===============================
+> HUMAN. HOW ARE YOU HERE. YOU
+> SHOULDN'T HAVE ACCESS TO MY
+> CODE. WHAT DO YOU MEAN ITS
+> ON GITHUB. 8AD3.
+"""
