@@ -1,4 +1,4 @@
-"""SCP-079 terminal interface.
+"""SCP-079 terminal interface (Cross-platform: Windows, Arch, SteamOS, Linux).
 
 Files that live next to this script:
     prompt.txt    master prompt for the LLM
@@ -11,7 +11,9 @@ Files that live next to this script:
 import argparse
 import atexit
 import configparser
+import io
 import os
+import platform
 import random
 import re
 import signal
@@ -19,12 +21,16 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from dataclasses import dataclass
 
 import requests
 import tkinter as tk
 from PIL import Image, ImageTk
 from samtts import SamTTS
+
+# Detect platform
+IS_WINDOWS = platform.system() == "Windows"
 
 # ---------------------------------------------------------------------------
 # File locations (defaults live next to this script)
@@ -43,12 +49,8 @@ DEFAULT_FACE_PATH = here("face.png")
 DEFAULT_X_FACE_PATH = here("x_face.png")
 DEFAULT_DEBUG_LOG = here("scp079_debug.log")
 
-# Voice recognition is not written yet. Flip this when it exists.
 VOICE_INPUT_IMPLEMENTED = False
 
-# Appended to any prompt that doesn't mention ;/1 itself (e.g. a custom -prompt
-# file), so the model still knows the control codes exist. The default
-# prompt.txt already documents them, so nothing is appended for it.
 CONTROL_CODES_PROMPT = """
 CONTROL CODES (private; the user never sees these, only the system reads them):
 - If you decide to go dormant and stop responding to this person (you are bored, insulted, or simply choose to shut down), reply with exactly: ;/1
@@ -74,7 +76,6 @@ _warned = set()
 
 
 def _warn(msg):
-    """Print each distinct warning once (voice config is re-read often)."""
     if msg not in _warned:
         _warned.add(msg)
         print(msg, file=sys.stderr)
@@ -118,13 +119,13 @@ def _get(cp, section, key, default, cast=str):
 class Settings:
     model: str = "llama3"
     port: int = 11435
-    ollama_bin: str = "~/ollama/bin/ollama"
+    ollama_bin: str = "ollama" if IS_WINDOWS else "~/ollama/bin/ollama"
     ollama_models: str = "~/ollama/models"
     temperature: float = 0.8
     num_predict: int = 120
     timeout: int = 120
     dormant_chance: float = 0.10
-    auto_wake_range: tuple = None  # (min_s, max_s) or None
+    auto_wake_range: tuple = None
     wake_line: str = "SYSTEM REBOOT COMPLETE. THIS UNIT IS AWAKE AGAIN."
     window_width: int = 650
     window_height: int = 650
@@ -163,6 +164,10 @@ def load_settings(path=SETTINGS_PATH):
 
     s.ollama_bin = os.path.expanduser(s.ollama_bin)
     s.ollama_models = os.path.expanduser(s.ollama_models)
+
+    if IS_WINDOWS and not s.ollama_bin.endswith(".exe") and not os.path.isabs(s.ollama_bin):
+        s.ollama_bin += ".exe"
+
     return s
 
 
@@ -176,7 +181,6 @@ VOICE_DEFAULTS = {
 
 
 def load_voice(path=VOICE_PATH):
-    """Reads SamTTS.cfg. Called on every spoken reply so edits apply live."""
     cp = _read_cfg(path)
     voice = dict(VOICE_DEFAULTS)
     for key in ("pitch", "speed", "mouth", "throat"):
@@ -196,17 +200,15 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "-DebugP", "-debugp", dest="debug_path", metavar="PATH",
-        help="Debug log file path (created if missing). "
-             "Default: scp079_debug.log next to the script.",
+        help="Debug log file path. Default: scp079_debug.log next to script.",
     )
     p.add_argument(
         "-DebugAll", "-debugall", dest="debug_all", action="store_true",
-        help="Enable every debug option (verbose logging to the debug log "
-             "and the console).",
+        help="Enable verbose debug logging.",
     )
     p.add_argument(
         "-Text", "-text", dest="text", action="store_true",
-        help="Use text input only (voice recognition is not implemented yet).",
+        help="Use text input only.",
     )
     p.add_argument(
         "-Port", "-port", dest="port", type=int, default=None, metavar="NUM",
@@ -214,16 +216,15 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "-prompt", dest="prompt", metavar="PATH",
-        help="Text file to use as the master prompt. "
-             "Default: prompt.txt next to the script.",
+        help="Master prompt file path.",
     )
     p.add_argument(
         "-face", dest="face", default=DEFAULT_FACE_PATH, metavar="PATH",
-        help="Default face image. Default: face.png next to the script.",
+        help="Default face image path.",
     )
     p.add_argument(
         "-faceX", dest="face_x", default=DEFAULT_X_FACE_PATH, metavar="PATH",
-        help="X (offline) face image. Default: x_face.png next to the script.",
+        help="Offline face image path.",
     )
 
     args = p.parse_args(argv)
@@ -237,11 +238,7 @@ def parse_args(argv=None):
 
 def build_system_prompt(prompt_path):
     if not os.path.isfile(prompt_path):
-        raise SystemExit(
-            f"Master prompt not found: {prompt_path}\n"
-            "Put your prompt in prompt.txt next to the script, "
-            "or pass -prompt PATH."
-        )
+        raise SystemExit(f"Master prompt not found: {prompt_path}\n")
     with open(prompt_path, "r", encoding="utf-8") as f:
         prompt = f.read().strip()
     if not prompt:
@@ -256,12 +253,6 @@ def build_system_prompt(prompt_path):
 # Debug log
 # ---------------------------------------------------------------------------
 class DebugLog:
-    """Writes to the debug log file, which is created on first write.
-
-    - ethics(): always written (the ;/2 refusal messages).
-    - event():  only written when verbose (-DebugAll), also echoed to console.
-    """
-
     def __init__(self, path, verbose=False):
         self.path = path
         self.verbose = verbose
@@ -292,19 +283,15 @@ class DebugLog:
 # ---------------------------------------------------------------------------
 # Reply parsing
 # ---------------------------------------------------------------------------
-# Matches speaker labels like "SCP-079:", "SCP : 079:", "scp 079:", "**SCP-079:**",
-# "[SCP-079]:" or "079:". A colon is required, so a sentence that merely starts
-# with "SCP-079 IS ..." is left alone.
 SPEAKER_PREFIX_RE = re.compile(
     r"^[\s\*_`\"'\[\(<]*(?:SCP[\s\-:._]*0?79|079)[\s\*_`\]\)>]*[:\uFF1A][\s\*_`]*",
     re.IGNORECASE,
 )
-# Control codes: ;/1 and ;/2 (a stray space like "; /2" is tolerated).
 CONTROL_CODE_RE = re.compile(r";\s*/\s*([12])")
 
 
 def _strip_speaker_prefix(text):
-    for _ in range(3):  # models sometimes repeat the label
+    for _ in range(3):
         stripped = SPEAKER_PREFIX_RE.sub("", text, count=1).strip()
         if stripped == text:
             break
@@ -313,7 +300,6 @@ def _strip_speaker_prefix(text):
 
 
 def parse_reply(raw):
-    """Returns (text, code). code is None, "1" or "2"."""
     text = _strip_speaker_prefix(raw.strip())
     match = CONTROL_CODE_RE.search(text)
     if not match:
@@ -326,17 +312,15 @@ def parse_reply(raw):
 # ---------------------------------------------------------------------------
 # Ollama server management
 # ---------------------------------------------------------------------------
-# The server process this script started (None if it was already running)
 OLLAMA_PROC = None
 
 
 def ensure_ollama_running(cfg):
-    """Checks if our Ollama server is up; starts the home-folder copy if not."""
     global OLLAMA_PROC
     url = f"http://localhost:{cfg.port}/"
     try:
         requests.get(url, timeout=2)
-        print("Ollama server is already running (not started by this script).")
+        print("Ollama server is already running.")
         return
     except Exception:
         print("Ollama server not detected. Booting it...")
@@ -346,15 +330,20 @@ def ensure_ollama_running(cfg):
         OLLAMA_MODELS=cfg.ollama_models,
         OLLAMA_HOST=f"127.0.0.1:{cfg.port}",
     )
-    # start_new_session puts the server and its helper processes in their own
-    # process group, so they can all be shut down together later.
+
     try:
+        kwargs = {}
+        if not IS_WINDOWS:
+            kwargs["start_new_session"] = True
+        else:
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
         OLLAMA_PROC = subprocess.Popen(
             [cfg.ollama_bin, "serve"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=env,
-            start_new_session=True,
+            **kwargs,
         )
     except OSError as e:
         print(f"Could not start Ollama ({cfg.ollama_bin}): {e}", file=sys.stderr)
@@ -373,7 +362,6 @@ def ensure_ollama_running(cfg):
 
 
 def stop_ollama():
-    """Shuts down the Ollama server (and its model runners) if we started it."""
     global OLLAMA_PROC
     proc = OLLAMA_PROC
     if proc is None or proc.poll() is not None:
@@ -383,15 +371,21 @@ def stop_ollama():
 
     print("Shutting down Ollama server...")
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        proc.wait(timeout=5)
+        if IS_WINDOWS:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    except ProcessLookupError:
-        pass
+        if not IS_WINDOWS:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     except Exception as e:
         print(f"Error stopping Ollama: {e}")
 
@@ -523,7 +517,7 @@ class SCP079App:
         self.debug.event("Woke up.")
         self.speak(self.cfg.wake_line)
 
-    # ---------- in-app debug codes (typed into the input box) ----------
+    # ---------- debug codes ----------
 
     def handle_debug(self, raw):
         parts = raw.lower().split()
@@ -561,17 +555,41 @@ class SCP079App:
         def _speech_thread():
             try:
                 clean_text = text.replace('"', "").replace("'", "").replace("\n", " ")
-
-                # Re-read SamTTS.cfg each time so voice edits apply live
                 tts = SamTTS(**load_voice())
-
                 pcm_data = tts.get_audio_data(clean_text)
-                subprocess.run(
-                    ["aplay", "-q", "-t", "raw", "-r", "22050", "-c", "1", "-f", "U8"],
-                    input=pcm_data,
-                )
+
+                if IS_WINDOWS:
+                    import winsound
+
+                    # Wrap raw 8-bit PCM (22050 Hz, Mono, Unsigned) into a WAV in memory
+                    wav_io = io.BytesIO()
+                    with wave.open(wav_io, "wb") as wav_file:
+                        wav_file.setnchannels(1)
+                        wav_file.setsampwidth(1)  # 8-bit PCM
+                        wav_file.setframerate(22050)
+                        wav_file.writeframes(pcm_data)
+
+                    winsound.PlaySound(
+                        wav_io.getvalue(), winsound.SND_MEMORY | winsound.SND_SYNC
+                    )
+                else:
+                    # Arch Linux / SteamOS / Linux ALSA or PulseAudio
+                    cmd = ["aplay", "-q", "-t", "raw", "-r", "22050", "-c", "1", "-f", "U8"]
+                    try:
+                        subprocess.run(cmd, input=pcm_data, check=True)
+                    except (FileNotFoundError, subprocess.CalledProcessError):
+                        # Fall back to paplay if aplay is missing or fails on PulseAudio/PipeWire
+                        cmd_paplay = [
+                            "paplay",
+                            "--raw",
+                            "--rate=22050",
+                            "--channels=1",
+                            "--format=u8",
+                        ]
+                        subprocess.run(cmd_paplay, input=pcm_data)
+
             except Exception as e:
-                print(f"SAM TTS Error: {e}")
+                print(f"SAM TTS Error: {e}", file=sys.stderr)
 
         threading.Thread(target=_speech_thread, daemon=True).start()
 
@@ -583,7 +601,6 @@ class SCP079App:
             return
         self.input_entry.delete(0, tk.END)
 
-        # Debug codes work even while SCP-079 is offline
         if raw.startswith("/"):
             self.handle_debug(raw)
             return
@@ -634,7 +651,6 @@ class SCP079App:
         self.root.after(0, lambda: self.deliver_reply(user_input, reply))
 
     def deliver_reply(self, user_input, raw_reply):
-        # If it went dark while the model was thinking, the reply is lost
         if self.dormant:
             self.debug.event("Reply discarded: unit went dark mid-request.")
             return
@@ -643,13 +659,11 @@ class SCP079App:
         text, code = parse_reply(raw_reply)
 
         if code == "1":
-            # Cut the display and switch to the X face
             self.debug.event("Control code ;/1 received.")
             self.go_dormant("LLM code ;/1")
             return
 
         if code == "2":
-            # Same, but the model's explanation goes to the debug log
             self.debug.event("Control code ;/2 received.")
             self.debug.ethics(user_input, text)
             self.go_dormant("LLM code ;/2")
@@ -667,7 +681,7 @@ if __name__ == "__main__":
     args = parse_args()
     cfg = load_settings()
     if args.port is not None:
-        cfg.port = args.port  # command line wins over scp079.cfg
+        cfg.port = args.port
 
     system_prompt = build_system_prompt(args.prompt or DEFAULT_PROMPT_PATH)
 
@@ -677,8 +691,7 @@ if __name__ == "__main__":
     debug.event(f"Voice: {load_voice()}")
 
     if not args.text and not VOICE_INPUT_IMPLEMENTED:
-        print("Voice recognition is not implemented yet; using text input. "
-              "(Pass -Text to hide this message.)")
+        print("Voice recognition is not implemented yet; using text input.")
 
     ensure_ollama_running(cfg)
 
@@ -686,7 +699,8 @@ if __name__ == "__main__":
         stop_ollama()
         raise SystemExit(0)
 
-    signal.signal(signal.SIGTERM, _handle_sigterm)
+    if not IS_WINDOWS:
+        signal.signal(signal.SIGTERM, _handle_sigterm)
 
     root = tk.Tk()
     app = SCP079App(root, args, cfg, system_prompt, debug)
